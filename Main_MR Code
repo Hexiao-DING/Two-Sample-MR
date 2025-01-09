@@ -1,0 +1,397 @@
+###############################################################################
+# 0. Load required packages
+###############################################################################
+library(dplyr)
+library(data.table)
+library(readr)
+library(TwoSampleMR)    # Key package for format_data, harmonise_data, mr, etc.
+library(ggplot2)
+
+###############################################################################
+# 1. Define file paths & read GWAS for Trait A and Trait B
+###############################################################################
+file_path_trait_A <- "D:/Projects_data&code/MR_study_AD_Depression/data/PGC_UKB_depression_genome-wide.txt"
+file_path_trait_B <- "D:/Projects_data&code/MR_study_AD_Depression/data/GCST90027158.tsv.gz"
+
+plink_path <- "D:/Projects_data&code/MR_study_AD_Depression/data/local_clump/plink/plink.exe"
+bfile_path <- "D:/Projects_data&code/MR_study_AD_Depression/data/local_clump/EUR/EUR"
+
+cat("\n=== Step 1: Read in Trait A & Trait B original GWAS ===\n")
+
+# 1.1 Trait A: rename columns, uppercase alleles
+gwas_trait_A_raw <- read_table2(
+  file_path_trait_A,
+  col_names = TRUE
+) %>%
+  rename(
+    ID     = MarkerName,
+    ALT    = A1,
+    REF    = A2,
+    eaf    = Freq,         # effect allele frequency
+    beta   = LogOR,        # log(OR)
+    sebeta = StdErrLogOR,  # std error of log(OR)
+    pval   = P
+  ) %>%
+  mutate(
+    ALT = toupper(ALT),    # uppercase alleles
+    REF = toupper(REF),
+    n   = 500119           # <-- Adjust to your actual sample size
+  )
+
+cat("  Trait A first rows:\n")
+print(head(gwas_trait_A_raw))
+
+# 1.2 Trait B
+gwas_trait_B_raw <- read_tsv(file_path_trait_B, col_names = TRUE)
+
+cat("\n  Trait B first rows:\n")
+print(head(gwas_trait_B_raw))
+
+###############################################################################
+# 2. Process Trait A as exposure: p<5e-8, LD clump => new_exposure_A
+###############################################################################
+cat("\n=== Step 2: Process Trait A (exposure) & LD clump ===\n")
+
+# 2.1 Filter p < 5e-8
+gwas_trait_A_exp <- gwas_trait_A_raw %>%
+  mutate(n = n) %>%
+  filter(pval < 5e-8 & !is.na(ID))
+
+cat("  Number of significant SNPs in A_exposure (p<5e-8):", nrow(gwas_trait_A_exp), "\n")
+
+# 2.2 Format for exposure
+formatted_trait_A_exposure <- format_data(
+  gwas_trait_A_exp,
+  type               = "exposure",
+  snp_col           = "ID",
+  beta_col          = "beta",
+  se_col            = "sebeta",
+  effect_allele_col = "ALT",
+  other_allele_col  = "REF",
+  pval_col          = "pval",
+  eaf_col           = "eaf",
+  samplesize_col    = "n"
+)
+cat("  After formatting (A_exposure):", nrow(formatted_trait_A_exposure), "\n")
+
+# 2.3 LD clump with local PLINK
+a_exposure_for_clump <- formatted_trait_A_exposure %>%
+  dplyr::select(SNP, pval.exposure, exposure)
+
+independent_trait_A_exp <- clump_data(
+  dat       = a_exposure_for_clump,
+  clump_kb  = 5000,
+  clump_r2  = 0.01,
+  bfile     = bfile_path,
+  plink_bin = plink_path
+)
+cat("  After clump (A_exposure):", nrow(independent_trait_A_exp), "\n")
+
+# 2.4 Merge clumped SNPs back with all columns from formatted_trait_A_exposure
+# Avoid .x / .y duplication by specifying suffixes explicitly
+independent_trait_A_exp <- independent_trait_A_exp %>%
+  left_join(formatted_trait_A_exposure,
+            by = "SNP",
+            suffix = c("", ".dup"))
+
+# 2.5 Remove palindromic SNPs, eaf near 0.5
+# Then rename columns so format_data can find them.
+# Note that we only rename from one set of columns (the ".dup" columns are duplicates).
+independent_trait_A_exp <- independent_trait_A_exp %>%
+  rename(
+    # Take columns from the original (non-".dup") or from ".dup" as needed.
+    beta          = beta.exposure,
+    se            = se.exposure,
+    effect_allele = effect_allele.exposure,
+    other_allele  = other_allele.exposure,
+    eaf           = eaf.exposure,
+    pval          = pval.exposure,
+    samplesize    = samplesize.exposure
+    # We don't rename the .dup columns; you can remove them if you like
+  ) %>%
+  # Optionally remove .dup columns if you want a clean final data frame
+  dplyr::select(-ends_with(".dup")) %>%
+  # Filter out palindromic SNPs
+  filter(!(
+    (effect_allele %in% c("A","T") & other_allele %in% c("A","T")) |
+      (effect_allele %in% c("C","G") & other_allele %in% c("C","G"))
+  )) %>%
+  # Filter out eaf ~0.5
+  filter(!(eaf > 0.49 & eaf < 0.51))
+
+# 2.6 Create final new_exposure_A (no index mismatch)
+new_exposure_A <- format_data(
+  independent_trait_A_exp,
+  type               = "exposure",
+  snp_col           = "SNP",
+  beta_col          = "beta",
+  se_col            = "se",
+  effect_allele_col = "effect_allele",
+  other_allele_col  = "other_allele",
+  eaf_col           = "eaf",
+  pval_col          = "pval",
+  samplesize_col    = "samplesize"
+)
+cat("  Rows in new_exposure_A:", nrow(new_exposure_A), "\n")
+
+###############################################################################
+# 3. Process Trait B as exposure: p<5e-8, LD clump => new_exposure_B
+###############################################################################
+cat("\n=== Step 3: Process Trait B (exposure) & LD clump ===\n")
+
+# 3.1 Filter p < 5e-8
+gwas_trait_B_exp <- gwas_trait_B_raw %>%
+  rename(eaf = effect_allele_frequency) %>%
+  mutate(n = 487511) %>%
+  filter(!is.na(variant_id)) %>%
+  filter(p_value < 5e-8)
+
+cat("  Number of significant SNPs in B_exposure (p<5e-8):", nrow(gwas_trait_B_exp), "\n")
+
+# 3.2 Format for exposure
+formatted_trait_B_exposure <- format_data(
+  gwas_trait_B_exp,
+  type               = "exposure",
+  snp_col           = "variant_id",
+  beta_col          = "beta",
+  se_col            = "standard_error",
+  effect_allele_col = "effect_allele",
+  other_allele_col  = "other_allele",
+  eaf_col           = "eaf",
+  pval_col          = "p_value",
+  samplesize_col    = "n"
+)
+cat("  After formatting (B_exposure):", nrow(formatted_trait_B_exposure), "\n")
+
+# 3.3 Keep full columns for clumping, to avoid losing data
+b_exposure_for_clump <- formatted_trait_B_exposure %>%
+  dplyr::select(SNP, pval.exposure, exposure, everything())
+
+independent_trait_B_exp <- clump_data(
+  dat       = b_exposure_for_clump,
+  clump_kb  = 5000,
+  clump_r2  = 0.01,
+  bfile     = bfile_path,
+  plink_bin = plink_path
+)
+cat("  After clump (B_exposure):", nrow(independent_trait_B_exp), "\n")
+
+# 3.4 Merge back, avoid .x / .y duplication
+independent_trait_B_exp <- independent_trait_B_exp %>%
+  left_join(b_exposure_for_clump,
+            by = "SNP",
+            suffix = c("", ".dup"))
+
+# 3.5 Rename columns to feed into format_data, remove duplicates
+independent_trait_B_exp <- independent_trait_B_exp %>%
+  rename(
+    beta          = beta.exposure,
+    se            = se.exposure,
+    effect_allele = effect_allele.exposure,
+    other_allele  = other_allele.exposure,
+    eaf           = eaf.exposure,
+    pval          = pval.exposure,
+    samplesize    = samplesize.exposure
+  ) %>%
+  dplyr::select(-ends_with(".dup")) %>%
+  # Filter out palindromic/eaf ~0.5
+  filter(!(
+    (effect_allele %in% c("A","T") & other_allele %in% c("A","T")) |
+      (effect_allele %in% c("C","G") & other_allele %in% c("C","G"))
+  )) %>%
+  filter(!(eaf > 0.49 & eaf < 0.51))
+
+# 3.6 Final new_exposure_B
+new_exposure_B <- format_data(
+  independent_trait_B_exp,
+  type               = "exposure",
+  snp_col           = "SNP",
+  beta_col          = "beta",
+  se_col            = "se",
+  effect_allele_col = "effect_allele",
+  other_allele_col  = "other_allele",
+  eaf_col           = "eaf",
+  pval_col          = "pval",
+  samplesize_col    = "samplesize"
+)
+cat("  Rows in new_exposure_B:", nrow(new_exposure_B), "\n")
+
+###############################################################################
+# 4. Prepare A, B as outcome (no p-value or LD clump filtering)
+###############################################################################
+cat("\n=== Step 4: A,B as outcome - no external filtering ===\n")
+
+## 4.1 A as outcome
+cat("\n--- 4.1 A as outcome ---\n")
+gwas_trait_A_out <- gwas_trait_A_raw %>%
+  mutate(n = 500119)
+
+formatted_trait_A_outcome <- format_data(
+  gwas_trait_A_out,
+  type               = "outcome",
+  snp_col           = "ID",
+  beta_col          = "beta",
+  se_col            = "sebeta",
+  effect_allele_col = "ALT",
+  other_allele_col  = "REF",
+  eaf_col           = "eaf",
+  pval_col          = "pval",
+  samplesize_col    = "n"
+)
+cat("  Rows in A_outcome (no filtering):", nrow(formatted_trait_A_outcome), "\n")
+
+## 4.2 B as outcome
+cat("\n--- 4.2 B as outcome ---\n")
+gwas_trait_B_out <- gwas_trait_B_raw %>%
+  rename(eaf = effect_allele_frequency) %>%
+  mutate(n = 487511)
+
+formatted_trait_B_outcome <- format_data(
+  gwas_trait_B_out,
+  type               = "outcome",
+  snp_col           = "variant_id",
+  beta_col          = "beta",
+  se_col            = "standard_error",
+  effect_allele_col = "effect_allele",
+  other_allele_col  = "other_allele",
+  eaf_col           = "eaf",
+  pval_col          = "p_value",
+  samplesize_col    = "n"
+)
+cat("  Rows in B_outcome (no filtering):", nrow(formatted_trait_B_outcome), "\n")
+
+###############################################################################
+# 5. A->B harmonization & MR
+###############################################################################
+cat("\n=== Step 5: A->B MR analysis (A_exposure, B_outcome) ===\n")
+cat("  new_exposure_A rows:", nrow(new_exposure_A), "\n")
+cat("  B_outcome rows:", nrow(formatted_trait_B_outcome), "\n")
+
+harmonized_A_to_B <- harmonise_data(new_exposure_A, formatted_trait_B_outcome, action = 2)
+cat("  Harmonized A->B rows:", nrow(harmonized_A_to_B), "\n")
+
+# 5.1 Filter F >= 10
+harmonized_A_to_B <- harmonized_A_to_B %>%
+  mutate(
+    R2 = (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2) /
+      (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2 +
+         2 * eaf.exposure * (1 - eaf.exposure) * se.exposure^2 * samplesize.exposure),
+    F  = (R2 * (samplesize.exposure - 2)) / (1 - R2)
+  ) %>%
+  filter(F >= 10)
+cat("  After F filter (A->B):", nrow(harmonized_A_to_B), "\n")
+
+if (nrow(harmonized_A_to_B) > 0) {
+  mr_result_A_to_B <- mr(harmonized_A_to_B)
+  cat("\n[ A->B MR analysis results ]\n")
+  print(mr_result_A_to_B)
+} else {
+  cat("\n[ A->B MR failed: no valid SNPs with F >= 10 ]\n")
+}
+
+###############################################################################
+# 6. B->A harmonization & MR
+###############################################################################
+cat("\n=== Step 6: B->A MR analysis (B_exposure, A_outcome) ===\n")
+cat("  new_exposure_B rows:", nrow(new_exposure_B), "\n")
+cat("  A_outcome rows:", nrow(formatted_trait_A_outcome), "\n")
+
+harmonized_B_to_A <- harmonise_data(new_exposure_B, formatted_trait_A_outcome, action = 2)
+cat("  Harmonized B->A rows:", nrow(harmonized_B_to_A), "\n")
+
+harmonized_B_to_A <- harmonized_B_to_A %>%
+  mutate(
+    R2 = (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2) /
+      (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2 +
+         2 * eaf.exposure * (1 - eaf.exposure) * se.exposure^2 * samplesize.exposure),
+    F  = (R2 * (samplesize.exposure - 2)) / (1 - R2)
+  ) %>%
+  filter(F >= 10)
+cat("  After F filter (B->A):", nrow(harmonized_B_to_A), "\n")
+
+if (nrow(harmonized_B_to_A) > 0) {
+  mr_result_B_to_A <- mr(harmonized_B_to_A)
+  cat("\n[ B->A MR analysis results ]\n")
+  print(mr_result_B_to_A)
+} else {
+  cat("\n[ B->A MR failed: no valid SNPs with F >= 10 ]\n")
+}
+
+###############################################################################
+# 7. (Optional) Sensitivity analyses & plots
+###############################################################################
+# 7.1 Sensitivity for A->B
+cat("\n=== Step 7.1: Sensitivity Analysis (A->B) ===\n")
+if (exists("harmonized_A_to_B") && nrow(harmonized_A_to_B) >= 2) {
+  
+  cat("\n--- 7.1.1 Heterogeneity test (IVW / Egger) ---\n")
+  hetero_res_AB <- mr_heterogeneity(harmonized_A_to_B,
+                                    method_list = c("mr_egger_regression", "mr_ivw"))
+  print(hetero_res_AB)
+  
+  cat("\n--- 7.1.2 Egger pleiotropy test ---\n")
+  pleio_res_AB <- mr_pleiotropy_test(harmonized_A_to_B)
+  print(pleio_res_AB)
+  
+  cat("\n--- 7.1.3 Leave-one-out ---\n")
+  loo_res_AB <- mr_leaveoneout(harmonized_A_to_B, method = "mr_ivw")
+  print(head(loo_res_AB))
+  
+  cat("\n--- 7.1.4 Single SNP analysis + Forest plot ---\n")
+  single_res_AB <- mr_singlesnp(harmonized_A_to_B)
+  print(head(single_res_AB))
+  
+  # Generate plots
+  p_forest_AB  <- mr_forest_plot(single_res_AB)
+  p_scatter_AB <- mr_scatter_plot(mr(harmonized_A_to_B), harmonized_A_to_B)
+  p_funnel_AB  <- mr_funnel_plot(single_res_AB)
+  p_loo_AB     <- mr_leaveoneout_plot(loo_res_AB)
+  
+  cat("\n--- 7.1.5 Example plots (A->B) ---\n")
+  print(p_forest_AB[[1]])
+  print(p_scatter_AB[[1]])
+  print(p_funnel_AB[[1]])
+  print(p_loo_AB[[1]])
+  
+} else {
+  cat("\n[ A->B Sensitivity Analysis: insufficient SNPs or object not found ]\n")
+}
+
+# 7.2 Sensitivity for B->A
+cat("\n=== Step 7.2: Sensitivity Analysis (B->A) ===\n")
+if (exists("harmonized_B_to_A") && nrow(harmonized_B_to_A) >= 2) {
+  
+  cat("\n--- 7.2.1 Heterogeneity test (IVW / Egger) ---\n")
+  hetero_res_BA <- mr_heterogeneity(harmonized_B_to_A,
+                                    method_list = c("mr_egger_regression", "mr_ivw"))
+  print(hetero_res_BA)
+  
+  cat("\n--- 7.2.2 Egger pleiotropy test ---\n")
+  pleio_res_BA <- mr_pleiotropy_test(harmonized_B_to_A)
+  print(pleio_res_BA)
+  
+  cat("\n--- 7.2.3 Leave-one-out ---\n")
+  loo_res_BA <- mr_leaveoneout(harmonized_B_to_A, method = "mr_ivw")
+  print(head(loo_res_BA))
+  
+  cat("\n--- 7.2.4 Single SNP analysis + Forest plot ---\n")
+  single_res_BA <- mr_singlesnp(harmonized_B_to_A)
+  print(head(single_res_BA))
+  
+  # Generate plots
+  p_forest_BA  <- mr_forest_plot(single_res_BA)
+  p_scatter_BA <- mr_scatter_plot(mr(harmonized_B_to_A), harmonized_B_to_A)
+  p_funnel_BA  <- mr_funnel_plot(single_res_BA)
+  p_loo_BA     <- mr_leaveoneout_plot(loo_res_BA)
+  
+  cat("\n--- 7.2.5 Example plots (B->A) ---\n")
+  print(p_forest_BA[[1]])
+  print(p_scatter_BA[[1]])
+  print(p_funnel_BA[[1]])
+  print(p_loo_BA[[1]])
+  
+} else {
+  cat("\n[ B->A Sensitivity Analysis: insufficient SNPs or object not found ]\n")
+}
+
+cat("\n=== All steps finished! Good luck with your MR study! ===\n")
