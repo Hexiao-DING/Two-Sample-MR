@@ -1,0 +1,472 @@
+# 设置R的最大打印选项，以防输出过多被截断
+options(max.print = 1000000)
+
+# 1. 加载所需的R包
+# 如果尚未安装这些包，请先取消注释并运行安装命令
+# install.packages(c("dplyr", "data.table", "readr", "ggplot2"))
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("TwoSampleMR")
+
+library(dplyr)
+library(data.table)
+library(readr)
+library(TwoSampleMR)    # 关键包，用于 format_data, harmonise_data, mr 等函数
+library(ggplot2)
+
+###############################################################################
+# 1. Define file paths & read GWAS for Trait A and Trait B
+###############################################################################
+
+# Trait B 文件路径
+file_path_trait_B <- "D:/Projects_data&code/MR_study_AD_Depression/data/PGC_UKB_depression_genome-wide.txt"
+
+# Trait A 文件目录
+trait_A_directory <- "D:/Projects_data&code/MR_study_AD_Depression/data/Inflammatory Proteins/"
+
+# PLINK 和基因型文件路径
+plink_path <- "D:/Projects_data&code/MR_study_AD_Depression/data/local_clump/plink/plink.exe"
+bfile_path <- "D:/Projects_data&code/MR_study_AD_Depression/data/local_clump/EUR/EUR"  # 不需要后缀，如 .bed, .bim, .fam
+
+# 输出目录
+output_directory <- "D:/Projects_data&code/MR_study_AD_Depression/data/results2"
+
+# 创建输出目录（如果不存在）
+if (!dir.exists(output_directory)) {
+  dir.create(output_directory, recursive = TRUE)
+}
+
+###############################################################################
+# 2. 读取并处理 Trait B 数据
+###############################################################################
+
+cat("\n=== Step 1: Read in Trait B original GWAS ===\n")
+
+# 2.1 Trait B: 重命名列，转换等位基因为大写，并设置样本量
+gwas_trait_B_raw <- read_table2(
+  file_path_trait_B,
+  col_names = TRUE
+) %>%
+  rename(
+    SNP     = MarkerName,         # 将 'MarkerName' 重命名为 'SNP'
+    ALT     = A1,                 # 替换为 'A1'
+    REF     = A2,                 # 替换为 'A2'
+    eaf     = Freq,               # effect allele frequency
+    beta    = LogOR,              # log(OR)
+    sebeta  = StdErrLogOR,        # std error of log(OR)
+    pval    = P                    # P值
+  ) %>%
+  mutate(
+    ALT = toupper(ALT),             # uppercase alleles
+    REF = toupper(REF),
+    n   = 500119                    # 设置 Trait B 的样本量
+  )
+
+cat("  Trait B first rows:\n")
+print(head(gwas_trait_B_raw))
+
+###############################################################################
+# 3. Trait B 作为 Exposure 和 Outcome 的处理
+###############################################################################
+
+cat("\n=== Step 2: Process Trait B (exposure) & LD clump ===\n")
+
+# 3.1 筛选 p < 5e-8
+gwas_trait_B_exp <- gwas_trait_B_raw %>%
+  filter(pval < 5e-8 & !is.na(SNP))
+
+cat("  Number of significant SNPs in B_exposure (p<5e-8):", nrow(gwas_trait_B_exp), "\n")
+
+# 3.2 格式化为 Exposure
+formatted_trait_B_exposure <- format_data(
+  gwas_trait_B_exp,
+  type               = "exposure",
+  snp_col           = "SNP",
+  beta_col          = "beta",
+  se_col            = "sebeta",
+  effect_allele_col = "ALT",
+  other_allele_col  = "REF",
+  eaf_col           = "eaf",
+  pval_col          = "pval",
+  samplesize_col    = "n"
+) %>%
+  mutate(
+    id.exposure = "TraitB",
+    exposure = "TraitB"
+  )
+
+cat("  After formatting (B_exposure):", nrow(formatted_trait_B_exposure), "\n")
+
+# 3.3 LD clumping with local PLINK
+b_exposure_for_clump <- formatted_trait_B_exposure %>%
+  dplyr::select(SNP, pval.exposure, exposure)
+
+independent_trait_B_exp <- clump_data(
+  dat       = b_exposure_for_clump,
+  clump_kb  = 5000,
+  clump_r2  = 0.01,
+  bfile     = bfile_path,
+  plink_bin = plink_path
+)
+
+cat("  After clump (B_exposure):", nrow(independent_trait_B_exp), "\n")
+
+# 3.4 合并剪枝后的 SNP 与格式化后的 Exposure 数据
+independent_trait_B_exp <- independent_trait_B_exp %>%
+  left_join(formatted_trait_B_exposure,
+            by = "SNP",
+            suffix = c("", ".dup"))
+
+# 3.5 移除多余的列，过滤回文 SNP 和 eaf 接近 0.5 的 SNP
+independent_trait_B_exp <- independent_trait_B_exp %>%
+  rename(
+    beta          = beta.exposure,
+    se            = se.exposure,
+    effect_allele = effect_allele.exposure,
+    other_allele  = other_allele.exposure,
+    eaf           = eaf.exposure,
+    pval          = pval.exposure,
+    samplesize    = samplesize.exposure
+  ) %>%
+  dplyr::select(-ends_with(".dup")) %>%
+  # 过滤回文 SNP
+  filter(!(
+    (effect_allele %in% c("A","T") & other_allele %in% c("A","T")) |
+      (effect_allele %in% c("C","G") & other_allele %in% c("C","G"))
+  )) %>%
+  # 过滤 eaf 接近 0.5
+  filter(!(eaf > 0.49 & eaf < 0.51))
+
+# 3.6 创建 final new_exposure_B
+new_exposure_B <- format_data(
+  independent_trait_B_exp,
+  type               = "exposure",
+  snp_col           = "SNP",
+  beta_col          = "beta",
+  se_col            = "se",
+  effect_allele_col = "effect_allele",
+  other_allele_col  = "other_allele",
+  eaf_col           = "eaf",
+  pval_col          = "pval",
+  samplesize_col    = "samplesize"
+) %>%
+  mutate(
+    id.exposure = "TraitB",
+    exposure = "TraitB"
+  )
+
+cat("  Rows in new_exposure_B:", nrow(new_exposure_B), "\n")
+
+# 3.4 Trait B: 格式化为 Outcome
+formatted_trait_B_outcome <- format_data(
+  gwas_trait_B_raw,
+  type               = "outcome",
+  snp_col           = "SNP",
+  beta_col          = "beta",
+  se_col            = "sebeta",
+  effect_allele_col = "ALT",
+  other_allele_col  = "REF",
+  eaf_col           = "eaf",
+  pval_col          = "pval",
+  samplesize_col    = "n"
+) %>%
+  mutate(
+    id.outcome = "TraitB",
+    outcome = "TraitB"
+  )
+
+cat("  After formatting (Trait B as outcome):", nrow(formatted_trait_B_outcome), "\n")
+
+###############################################################################
+# 4. 获取 Trait A 文件列表
+###############################################################################
+# 文件名以 GCST9027475 至 GCST9027484 开头，接着一个数字（0-9），以 .tsv 或 .tsv.gz 结尾
+trait_A_files <- list.files(
+  path = trait_A_directory,
+  pattern = "^(GCST902747[5-9]|GCST902748[0-4])[0-9]\\.tsv(\\.gz)?$",
+  full.names = TRUE,
+  ignore.case = TRUE    # 忽略大小写
+)
+
+# 添加调试信息：列出所有匹配到的文件
+cat("=== 匹配到的 Trait A 文件列表 ===\n")
+print(trait_A_files)
+cat("=== Trait A 文件数量:", length(trait_A_files), "===\n")
+
+# 检查是否有 90 个 Trait A 文件
+if (length(trait_A_files) != 90) {
+  stop("Trait A 文件数量不为 90，请检查文件目录和命名模式。")
+}
+
+cat("找到", length(trait_A_files), "个 Trait A 文件。\n")
+
+###############################################################################
+# 5. 循环处理每个 Trait A 文件
+###############################################################################
+for (trait_A_file in trait_A_files) {
+  
+  # 获取 Trait A 文件名（不含路径）
+  trait_A_filename <- basename(trait_A_file)
+  
+  # 生成对应的输出文件路径（以 Trait A 文件名命名，扩展名为 .txt）
+  output_file <- file.path(output_directory, paste0(tools::file_path_sans_ext(trait_A_filename), ".txt"))
+  
+  cat("\n=== 正在处理文件:", trait_A_filename, "===\n")
+  
+  # 5.1 读取 Trait A 数据
+  gwas_trait_A_raw <- read_tsv(trait_A_file, col_names = TRUE, show_col_types = FALSE) %>%
+    rename(
+      ID = rsid,              # 在 Trait A 文件中，'rsid' 列存在
+      ALT = effect_allele,
+      REF = other_allele,
+      eaf = effect_allele_frequency,
+      beta = beta,
+      sebeta = standard_error,
+      pval = p_value,
+      n = n
+    ) %>%
+    mutate(
+      ALT = toupper(ALT),
+      REF = toupper(REF)
+    )
+  
+  cat("  Trait A first rows:\n")
+  print(head(gwas_trait_A_raw))
+  
+  # 5.2 格式化 Trait A 数据作为 Exposure
+  gwas_trait_A_exp <- gwas_trait_A_raw %>%
+    filter(pval < 5e-8 & !is.na(ID))
+  
+  formatted_trait_A_exposure <- format_data(
+    gwas_trait_A_exp,
+    type               = "exposure",
+    snp_col           = "ID",
+    beta_col          = "beta",
+    se_col            = "sebeta",
+    effect_allele_col = "ALT",
+    other_allele_col  = "REF",
+    eaf_col           = "eaf",
+    pval_col          = "pval",
+    samplesize_col    = "n"
+  ) %>%
+    mutate(
+      id.exposure = "TraitA",
+      exposure = "TraitA"
+    )
+  
+  cat("  Trait A (", trait_A_filename, ") 中显著 SNP 数量 (p < 5e-8):", nrow(formatted_trait_A_exposure), "\n")
+  
+  # 如果没有显著 SNP，跳过分析
+  if (nrow(formatted_trait_A_exposure) == 0) {
+    cat("  Trait A (", trait_A_filename, ") 没有显著 SNP，跳过分析。\n")
+    next
+  }
+  
+  # 5.3 进行 LD 剪枝
+  a_exposure_for_clump <- formatted_trait_A_exposure %>%
+    dplyr::select(SNP, pval.exposure, exposure)
+  
+  independent_trait_A_exp <- clump_data(
+    dat       = a_exposure_for_clump,
+    clump_kb  = 5000,
+    clump_r2  = 0.01,
+    bfile     = bfile_path,
+    plink_bin = plink_path
+  )
+  
+  cat("  Trait A (", trait_A_filename, ") LD 剪枝后 SNP 数量:", nrow(independent_trait_A_exp), "\n")
+  
+  # 如果没有独立 SNP，跳过分析
+  if (nrow(independent_trait_A_exp) == 0) {
+    cat("  Trait A (", trait_A_filename, ") 没有独立 SNP，跳过分析。\n")
+    next
+  }
+  
+  # 5.4 生成 new_exposure_A
+  new_exposure_A <- formatted_trait_A_exposure %>%
+    filter(SNP %in% independent_trait_A_exp$SNP)
+  
+  cat("  Trait A (", trait_A_filename, ") 生成 new_exposure_A SNP 数量:", nrow(new_exposure_A), "\n")
+  
+  # 5.5 和谐数据（A->B）
+  harmonized_A_to_B <- harmonise_data(new_exposure_A, formatted_trait_B_outcome, action = 2)
+  
+  # 检查 harmonized_A_to_B columns
+  required_outcome_cols <- c("SNP", "id.outcome", "outcome", "beta.outcome", "se.outcome", "effect_allele.outcome", "other_allele.outcome")
+  missing_cols <- setdiff(required_outcome_cols, colnames(harmonized_A_to_B))
+  if (length(missing_cols) > 0) {
+    cat("  Harmonized A->B 数据缺失列:", paste(missing_cols, collapse = ", "), "\n")
+  }
+  
+  # 5.6 筛选 F >= 10
+  harmonized_A_to_B <- harmonized_A_to_B %>%
+    mutate(
+      R2 = (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2) /
+        (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2 +
+           2 * eaf.exposure * (1 - eaf.exposure) * se.exposure^2 * samplesize.exposure),
+      F  = (R2 * (samplesize.exposure - 2)) / (1 - R2)
+    ) %>%
+    filter(F >= 10)
+  
+  cat("  Trait A->B 和谐后 SNP 数量 (F >= 10):", nrow(harmonized_A_to_B), "\n")
+  
+  # 5.7 进行 MR 分析（A->B）
+  if (nrow(harmonized_A_to_B) > 0) {
+    mr_result_A_to_B <- mr(harmonized_A_to_B)
+  } else {
+    mr_result_A_to_B <- "Trait A->B MR 分析失败：没有 SNP 满足 F >= 10。"
+  }
+  
+  # **关键修正点开始**
+  # 5.8 格式化 Trait A 数据作为 Outcome
+  formatted_trait_A_outcome <- format_data(
+    gwas_trait_A_raw,
+    type               = "outcome",
+    snp_col           = "ID",
+    beta_col          = "beta",
+    se_col            = "sebeta",
+    effect_allele_col = "ALT",
+    other_allele_col  = "REF",
+    eaf_col           = "eaf",
+    pval_col          = "pval",
+    samplesize_col    = "n"
+  ) %>%
+    mutate(
+      id.outcome = "TraitA",
+      outcome = "TraitA"
+    )
+  
+  # 5.9 和谐数据（B->A）
+  harmonized_B_to_A <- harmonise_data(formatted_trait_B_exposure, formatted_trait_A_outcome, action = 2)
+  
+  # 5.10 筛选 F >= 10
+  harmonized_B_to_A <- harmonized_B_to_A %>%
+    mutate(
+      R2 = (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2) /
+        (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2 +
+           2 * eaf.exposure * (1 - eaf.exposure) * se.exposure^2 * samplesize.exposure),
+      F  = (R2 * (samplesize.exposure - 2)) / (1 - R2)
+    ) %>%
+    filter(F >= 10)
+  
+  cat("  Trait B->A 和谐后 SNP 数量 (F >= 10):", nrow(harmonized_B_to_A), "\n")
+  
+  # 5.11 进行 MR 分析（B->A）
+  if (nrow(harmonized_B_to_A) > 0) {
+    mr_result_B_to_A <- mr(harmonized_B_to_A)
+  } else {
+    mr_result_B_to_A <- "Trait B->A MR 分析失败：没有 SNP 满足 F >= 10。"
+  }
+  # **关键修正点结束**
+  
+  # 5.12 进行敏感性分析（A->B）
+  if (nrow(harmonized_A_to_B) > 1) {
+    hetero_res_AB <- mr_heterogeneity(harmonized_A_to_B, method_list = c("mr_ivw", "mr_egger_regression"))
+    pleio_res_AB <- mr_pleiotropy_test(harmonized_A_to_B)
+    loo_res_AB <- mr_leaveoneout(harmonized_A_to_B)
+    single_res_AB <- mr_singlesnp(harmonized_A_to_B)
+  } else {
+    hetero_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
+    pleio_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
+    loo_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
+    single_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
+  }
+  
+  # 5.13 进行敏感性分析（B->A）
+  if (nrow(harmonized_B_to_A) > 1) {
+    hetero_res_BA <- mr_heterogeneity(harmonized_B_to_A, method_list = c("mr_ivw", "mr_egger_regression"))
+    pleio_res_BA <- mr_pleiotropy_test(harmonized_B_to_A)
+    loo_res_BA <- mr_leaveoneout(harmonized_B_to_A)
+    single_res_BA <- mr_singlesnp(harmonized_B_to_A)
+  } else {
+    hetero_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
+    pleio_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
+    loo_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
+    single_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
+  }
+  
+  # 5.14 将分析结果写入单独的 txt 文件
+  # 使用 tryCatch 确保 sink() 被正确关闭
+  tryCatch({
+    # 开启 sink()，将分析结果写入输出文件
+    sink(output_file, append = FALSE, type = "output")
+    
+    cat("=== Trait A 文件:", trait_A_filename, "===\n\n")
+    
+    cat("=== MR 分析 (A->B) ===\n")
+    if (is.character(mr_result_A_to_B)) {
+      cat(mr_result_A_to_B, "\n\n")
+    } else {
+      print(mr_result_A_to_B)
+      cat("\n")
+    }
+    
+    cat("=== MR 分析 (B->A) ===\n")
+    if (is.character(mr_result_B_to_A)) {
+      cat(mr_result_B_to_A, "\n\n")
+    } else {
+      print(mr_result_B_to_A)
+      cat("\n")
+    }
+    
+    cat("=== 敏感性分析 (A->B) ===\n")
+    if (is.character(hetero_res_AB)) {
+      cat(hetero_res_AB, "\n")
+    } else {
+      print(hetero_res_AB)
+    }
+    if (is.character(pleio_res_AB)) {
+      cat(pleio_res_AB, "\n")
+    } else {
+      print(pleio_res_AB)
+    }
+    if (is.character(loo_res_AB)) {
+      cat(loo_res_AB, "\n")
+    } else {
+      print(loo_res_AB)
+    }
+    if (is.character(single_res_AB)) {
+      cat(single_res_AB, "\n")
+    } else {
+      print(single_res_AB)
+    }
+    cat("\n")
+    
+    cat("=== 敏感性分析 (B->A) ===\n")
+    if (is.character(hetero_res_BA)) {
+      cat(hetero_res_BA, "\n")
+    } else {
+      print(hetero_res_BA)
+    }
+    if (is.character(pleio_res_BA)) {
+      cat(pleio_res_BA, "\n")
+    } else {
+      print(pleio_res_BA)
+    }
+    if (is.character(loo_res_BA)) {
+      cat(loo_res_BA, "\n")
+    } else {
+      print(loo_res_BA)
+    }
+    if (is.character(single_res_BA)) {
+      cat(single_res_BA, "\n")
+    } else {
+      print(single_res_BA)
+    }
+    cat("\n")
+    
+    cat("=== 分析完成 ===\n")
+    
+    # 关闭 sink()
+    sink()
+    
+  }, error = function(e) {
+    # 如果发生错误，确保 sink() 被关闭
+    sink()
+    cat("分析过程中发生错误：", conditionMessage(e), "\n")
+  })
+  
+  cat("  分析结果已保存到:", output_file, "\n")
+}
+
+cat("\n=== 所有 Trait A 文件的分析已完成。 ===\n")
