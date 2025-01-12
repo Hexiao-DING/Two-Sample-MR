@@ -15,7 +15,7 @@ library(TwoSampleMR)    # 关键包，用于 format_data, harmonise_data, mr 等
 library(ggplot2)
 
 ###############################################################################
-# 1. Define file paths & read GWAS for Trait A and Trait B
+# 1. 定义文件路径 & 读取 Trait A 和 Trait B 的 GWAS 数据
 ###############################################################################
 
 # Trait B 文件路径
@@ -40,7 +40,7 @@ if (!dir.exists(output_directory)) {
 # 2. 读取并处理 Trait B 数据
 ###############################################################################
 
-cat("\n=== Step 1: Read in Trait B original GWAS ===\n")
+cat("\n=== Step 1: Read and Process Trait B GWAS Data ===\n")
 
 # 2.1 Trait B: 重命名列，转换等位基因为大写，并设置样本量
 gwas_trait_B_raw <- read_table2(
@@ -66,18 +66,19 @@ cat("  Trait B first rows:\n")
 print(head(gwas_trait_B_raw))
 
 ###############################################################################
-# 3. Trait B 作为 Exposure 和 Outcome 的处理
+# 3. Trait B 作为 Exposure 和 Outcome 的处理，包括 LD 剪枝
 ###############################################################################
 
-cat("\n=== Step 2: Process Trait B (exposure) & LD clump ===\n")
+cat("\n=== Step 2: Process Trait B as Exposure and Outcome ===\n")
 
-# 3.1 筛选 p < 5e-8
+# 3.1 Trait B 作为 Exposure 的处理
+# 3.1.1 筛选 p < 5e-8
 gwas_trait_B_exp <- gwas_trait_B_raw %>%
   filter(pval < 5e-8 & !is.na(SNP))
 
 cat("  Number of significant SNPs in B_exposure (p<5e-8):", nrow(gwas_trait_B_exp), "\n")
 
-# 3.2 格式化为 Exposure
+# 3.1.2 格式化为 Exposure
 formatted_trait_B_exposure <- format_data(
   gwas_trait_B_exp,
   type               = "exposure",
@@ -95,12 +96,16 @@ formatted_trait_B_exposure <- format_data(
     exposure = "TraitB"
   )
 
-cat("  After formatting (B_exposure):", nrow(formatted_trait_B_exposure), "\n")
+cat("  After formatting (B_exposure):", nrow(formatted_trait_B_exposure), "SNPs\n")
 
-# 3.3 LD clumping with local PLINK
+# 3.1.3 LD 剪枝（clumping） for Trait B as Exposure
+cat("\n  === LD Clumping for Trait B as Exposure ===\n")
+
+# 准备进行 clumping 的数据
 b_exposure_for_clump <- formatted_trait_B_exposure %>%
   dplyr::select(SNP, pval.exposure, exposure)
 
+# 执行 clumping
 independent_trait_B_exp <- clump_data(
   dat       = b_exposure_for_clump,
   clump_kb  = 5000,
@@ -109,55 +114,17 @@ independent_trait_B_exp <- clump_data(
   plink_bin = plink_path
 )
 
-cat("  After clump (B_exposure):", nrow(independent_trait_B_exp), "\n")
+cat("  After clumping (B_exposure):", nrow(independent_trait_B_exp), "independent SNPs\n")
 
-# 3.4 合并剪枝后的 SNP 与格式化后的 Exposure 数据
-independent_trait_B_exp <- independent_trait_B_exp %>%
-  left_join(formatted_trait_B_exposure,
-            by = "SNP",
-            suffix = c("", ".dup"))
-
-# 3.5 移除多余的列，过滤回文 SNP 和 eaf 接近 0.5 的 SNP
-independent_trait_B_exp <- independent_trait_B_exp %>%
-  rename(
-    beta          = beta.exposure,
-    se            = se.exposure,
-    effect_allele = effect_allele.exposure,
-    other_allele  = other_allele.exposure,
-    eaf           = eaf.exposure,
-    pval          = pval.exposure,
-    samplesize    = samplesize.exposure
-  ) %>%
-  dplyr::select(-ends_with(".dup")) %>%
-  # 过滤回文 SNP
-  filter(!(
-    (effect_allele %in% c("A","T") & other_allele %in% c("A","T")) |
-      (effect_allele %in% c("C","G") & other_allele %in% c("C","G"))
-  )) %>%
-  # 过滤 eaf 接近 0.5
-  filter(!(eaf > 0.49 & eaf < 0.51))
-
-# 3.6 创建 final new_exposure_B
-new_exposure_B <- format_data(
-  independent_trait_B_exp,
-  type               = "exposure",
-  snp_col           = "SNP",
-  beta_col          = "beta",
-  se_col            = "se",
-  effect_allele_col = "effect_allele",
-  other_allele_col  = "other_allele",
-  eaf_col           = "eaf",
-  pval_col          = "pval",
-  samplesize_col    = "samplesize"
-) %>%
-  mutate(
-    id.exposure = "TraitB",
-    exposure = "TraitB"
-  )
+# 3.1.4 生成独立的 Exposure 数据集
+new_exposure_B <- formatted_trait_B_exposure %>%
+  filter(SNP %in% independent_trait_B_exp$SNP)
 
 cat("  Rows in new_exposure_B:", nrow(new_exposure_B), "\n")
 
-# 3.4 Trait B: 格式化为 Outcome
+# 3.2 Trait B 作为 Outcome 的处理
+cat("\n  === Formatting Trait B as Outcome ===\n")
+
 formatted_trait_B_outcome <- format_data(
   gwas_trait_B_raw,
   type               = "outcome",
@@ -175,11 +142,14 @@ formatted_trait_B_outcome <- format_data(
     outcome = "TraitB"
   )
 
-cat("  After formatting (Trait B as outcome):", nrow(formatted_trait_B_outcome), "\n")
+cat("  After formatting (Trait B as outcome):", nrow(formatted_trait_B_outcome), "SNPs\n")
 
 ###############################################################################
 # 4. 获取 Trait A 文件列表
 ###############################################################################
+
+cat("\n=== Step 3: Retrieve Trait A Files ===\n")
+
 # 文件名以 GCST9027475 至 GCST9027484 开头，接着一个数字（0-9），以 .tsv 或 .tsv.gz 结尾
 trait_A_files <- list.files(
   path = trait_A_directory,
@@ -189,20 +159,23 @@ trait_A_files <- list.files(
 )
 
 # 添加调试信息：列出所有匹配到的文件
-cat("=== 匹配到的 Trait A 文件列表 ===\n")
+cat("=== Matched Trait A Files ===\n")
 print(trait_A_files)
-cat("=== Trait A 文件数量:", length(trait_A_files), "===\n")
+cat("=== Number of Trait A Files:", length(trait_A_files), "===\n")
 
 # 检查是否有 90 个 Trait A 文件
 if (length(trait_A_files) != 90) {
   stop("Trait A 文件数量不为 90，请检查文件目录和命名模式。")
 }
 
-cat("找到", length(trait_A_files), "个 Trait A 文件。\n")
+cat("Found", length(trait_A_files), "Trait A files.\n")
 
 ###############################################################################
 # 5. 循环处理每个 Trait A 文件
 ###############################################################################
+
+cat("\n=== Step 4: Loop Through Each Trait A File ===\n")
+
 for (trait_A_file in trait_A_files) {
   
   # 获取 Trait A 文件名（不含路径）
@@ -211,7 +184,7 @@ for (trait_A_file in trait_A_files) {
   # 生成对应的输出文件路径（以 Trait A 文件名命名，扩展名为 .txt）
   output_file <- file.path(output_directory, paste0(tools::file_path_sans_ext(trait_A_filename), ".txt"))
   
-  cat("\n=== 正在处理文件:", trait_A_filename, "===\n")
+  cat("\n=== Processing File:", trait_A_filename, "===\n")
   
   # 5.1 读取 Trait A 数据
   gwas_trait_A_raw <- read_tsv(trait_A_file, col_names = TRUE, show_col_types = FALSE) %>%
@@ -233,10 +206,16 @@ for (trait_A_file in trait_A_files) {
   cat("  Trait A first rows:\n")
   print(head(gwas_trait_A_raw))
   
-  # 5.2 格式化 Trait A 数据作为 Exposure
+  # 5.2 Trait A 作为 Exposure 的处理
+  cat("  === Formatting Trait A as Exposure ===\n")
+  
+  # 筛选 p < 5e-8
   gwas_trait_A_exp <- gwas_trait_A_raw %>%
     filter(pval < 5e-8 & !is.na(ID))
   
+  cat("  Number of significant SNPs in A_exposure (p<5e-8):", nrow(gwas_trait_A_exp), "\n")
+  
+  # 格式化为 Exposure
   formatted_trait_A_exposure <- format_data(
     gwas_trait_A_exp,
     type               = "exposure",
@@ -254,18 +233,22 @@ for (trait_A_file in trait_A_files) {
       exposure = "TraitA"
     )
   
-  cat("  Trait A (", trait_A_filename, ") 中显著 SNP 数量 (p < 5e-8):", nrow(formatted_trait_A_exposure), "\n")
+  cat("  After formatting (A_exposure):", nrow(formatted_trait_A_exposure), "SNPs\n")
   
   # 如果没有显著 SNP，跳过分析
   if (nrow(formatted_trait_A_exposure) == 0) {
-    cat("  Trait A (", trait_A_filename, ") 没有显著 SNP，跳过分析。\n")
+    cat("  Trait A (", trait_A_filename, ") has no significant SNPs, skipping analysis.\n")
     next
   }
   
   # 5.3 进行 LD 剪枝
+  cat("  === LD Clumping for Trait A as Exposure ===\n")
+  
+  # 准备进行 clumping 的数据
   a_exposure_for_clump <- formatted_trait_A_exposure %>%
     dplyr::select(SNP, pval.exposure, exposure)
   
+  # 执行 clumping
   independent_trait_A_exp <- clump_data(
     dat       = a_exposure_for_clump,
     clump_kb  = 5000,
@@ -274,31 +257,36 @@ for (trait_A_file in trait_A_files) {
     plink_bin = plink_path
   )
   
-  cat("  Trait A (", trait_A_filename, ") LD 剪枝后 SNP 数量:", nrow(independent_trait_A_exp), "\n")
+  cat("  After clumping (A_exposure):", nrow(independent_trait_A_exp), "independent SNPs\n")
   
   # 如果没有独立 SNP，跳过分析
   if (nrow(independent_trait_A_exp) == 0) {
-    cat("  Trait A (", trait_A_filename, ") 没有独立 SNP，跳过分析。\n")
+    cat("  Trait A (", trait_A_filename, ") has no independent SNPs after clumping, skipping analysis.\n")
     next
   }
   
-  # 5.4 生成 new_exposure_A
+  # 5.4 生成独立的 Exposure 数据集
   new_exposure_A <- formatted_trait_A_exposure %>%
     filter(SNP %in% independent_trait_A_exp$SNP)
   
-  cat("  Trait A (", trait_A_filename, ") 生成 new_exposure_A SNP 数量:", nrow(new_exposure_A), "\n")
+  cat("  Rows in new_exposure_A:", nrow(new_exposure_A), "\n")
   
   # 5.5 和谐数据（A->B）
+  cat("  === Harmonising Data for A->B ===\n")
+  
   harmonized_A_to_B <- harmonise_data(new_exposure_A, formatted_trait_B_outcome, action = 2)
   
   # 检查 harmonized_A_to_B columns
-  required_outcome_cols <- c("SNP", "id.outcome", "outcome", "beta.outcome", "se.outcome", "effect_allele.outcome", "other_allele.outcome")
+  required_outcome_cols <- c("SNP", "id.outcome", "outcome", "beta.outcome", "se.outcome", 
+                             "effect_allele.outcome", "other_allele.outcome")
   missing_cols <- setdiff(required_outcome_cols, colnames(harmonized_A_to_B))
   if (length(missing_cols) > 0) {
-    cat("  Harmonized A->B 数据缺失列:", paste(missing_cols, collapse = ", "), "\n")
+    cat("  Harmonized A->B data is missing columns:", paste(missing_cols, collapse = ", "), "\n")
   }
   
   # 5.6 筛选 F >= 10
+  cat("  === Filtering SNPs with F >= 10 for A->B ===\n")
+  
   harmonized_A_to_B <- harmonized_A_to_B %>%
     mutate(
       R2 = (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2) /
@@ -308,17 +296,20 @@ for (trait_A_file in trait_A_files) {
     ) %>%
     filter(F >= 10)
   
-  cat("  Trait A->B 和谐后 SNP 数量 (F >= 10):", nrow(harmonized_A_to_B), "\n")
+  cat("  SNPs after F >= 10 filter (A->B):", nrow(harmonized_A_to_B), "\n")
   
   # 5.7 进行 MR 分析（A->B）
+  cat("  === Performing MR Analysis (A->B) ===\n")
+  
   if (nrow(harmonized_A_to_B) > 0) {
     mr_result_A_to_B <- mr(harmonized_A_to_B)
   } else {
-    mr_result_A_to_B <- "Trait A->B MR 分析失败：没有 SNP 满足 F >= 10。"
+    mr_result_A_to_B <- "Trait A->B MR analysis failed: No SNPs with F >= 10."
   }
   
-  # **关键修正点开始**
-  # 5.8 格式化 Trait A 数据作为 Outcome
+  # 5.8 Trait A 作为 Outcome 的处理
+  cat("  === Formatting Trait A as Outcome ===\n")
+  
   formatted_trait_A_outcome <- format_data(
     gwas_trait_A_raw,
     type               = "outcome",
@@ -336,10 +327,22 @@ for (trait_A_file in trait_A_files) {
       outcome = "TraitA"
     )
   
-  # 5.9 和谐数据（B->A）
-  harmonized_B_to_A <- harmonise_data(formatted_trait_B_exposure, formatted_trait_A_outcome, action = 2)
+  cat("  After formatting (Trait A as outcome):", nrow(formatted_trait_A_outcome), "SNPs\n")
+  
+  # 5.9 和谐数据（B->A）使用 clumped Exposure
+  cat("  === Harmonising Data for B->A ===\n")
+  
+  harmonized_B_to_A <- harmonise_data(new_exposure_B, formatted_trait_A_outcome, action = 2)
+  
+  # 检查 harmonized_B_to_A columns
+  missing_cols_BA <- setdiff(required_outcome_cols, colnames(harmonized_B_to_A))
+  if (length(missing_cols_BA) > 0) {
+    cat("  Harmonized B->A data is missing columns:", paste(missing_cols_BA, collapse = ", "), "\n")
+  }
   
   # 5.10 筛选 F >= 10
+  cat("  === Filtering SNPs with F >= 10 for B->A ===\n")
+  
   harmonized_B_to_A <- harmonized_B_to_A %>%
     mutate(
       R2 = (2 * eaf.exposure * (1 - eaf.exposure) * beta.exposure^2) /
@@ -349,51 +352,58 @@ for (trait_A_file in trait_A_files) {
     ) %>%
     filter(F >= 10)
   
-  cat("  Trait B->A 和谐后 SNP 数量 (F >= 10):", nrow(harmonized_B_to_A), "\n")
+  cat("  SNPs after F >= 10 filter (B->A):", nrow(harmonized_B_to_A), "\n")
   
   # 5.11 进行 MR 分析（B->A）
+  cat("  === Performing MR Analysis (B->A) ===\n")
+  
   if (nrow(harmonized_B_to_A) > 0) {
     mr_result_B_to_A <- mr(harmonized_B_to_A)
   } else {
-    mr_result_B_to_A <- "Trait B->A MR 分析失败：没有 SNP 满足 F >= 10。"
+    mr_result_B_to_A <- "Trait B->A MR analysis failed: No SNPs with F >= 10."
   }
-  # **关键修正点结束**
   
   # 5.12 进行敏感性分析（A->B）
+  cat("  === Performing Sensitivity Analysis (A->B) ===\n")
+  
   if (nrow(harmonized_A_to_B) > 1) {
     hetero_res_AB <- mr_heterogeneity(harmonized_A_to_B, method_list = c("mr_ivw", "mr_egger_regression"))
     pleio_res_AB <- mr_pleiotropy_test(harmonized_A_to_B)
     loo_res_AB <- mr_leaveoneout(harmonized_A_to_B)
     single_res_AB <- mr_singlesnp(harmonized_A_to_B)
   } else {
-    hetero_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
-    pleio_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
-    loo_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
-    single_res_AB <- "Trait A->B 敏感性分析失败：SNP 数量不足。"
+    hetero_res_AB <- "Trait A->B Sensitivity analysis failed: Insufficient SNPs."
+    pleio_res_AB <- "Trait A->B Sensitivity analysis failed: Insufficient SNPs."
+    loo_res_AB <- "Trait A->B Sensitivity analysis failed: Insufficient SNPs."
+    single_res_AB <- "Trait A->B Sensitivity analysis failed: Insufficient SNPs."
   }
   
   # 5.13 进行敏感性分析（B->A）
+  cat("  === Performing Sensitivity Analysis (B->A) ===\n")
+  
   if (nrow(harmonized_B_to_A) > 1) {
     hetero_res_BA <- mr_heterogeneity(harmonized_B_to_A, method_list = c("mr_ivw", "mr_egger_regression"))
     pleio_res_BA <- mr_pleiotropy_test(harmonized_B_to_A)
     loo_res_BA <- mr_leaveoneout(harmonized_B_to_A)
     single_res_BA <- mr_singlesnp(harmonized_B_to_A)
   } else {
-    hetero_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
-    pleio_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
-    loo_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
-    single_res_BA <- "Trait B->A 敏感性分析失败：SNP 数量不足。"
+    hetero_res_BA <- "Trait B->A Sensitivity analysis failed: Insufficient SNPs."
+    pleio_res_BA <- "Trait B->A Sensitivity analysis failed: Insufficient SNPs."
+    loo_res_BA <- "Trait B->A Sensitivity analysis failed: Insufficient SNPs."
+    single_res_BA <- "Trait B->A Sensitivity analysis failed: Insufficient SNPs."
   }
   
   # 5.14 将分析结果写入单独的 txt 文件
+  cat("  === Writing Results to File ===\n")
+  
   # 使用 tryCatch 确保 sink() 被正确关闭
   tryCatch({
     # 开启 sink()，将分析结果写入输出文件
     sink(output_file, append = FALSE, type = "output")
     
-    cat("=== Trait A 文件:", trait_A_filename, "===\n\n")
+    cat("=== Trait A File:", trait_A_filename, "===\n\n")
     
-    cat("=== MR 分析 (A->B) ===\n")
+    cat("=== MR Analysis (A->B) ===\n")
     if (is.character(mr_result_A_to_B)) {
       cat(mr_result_A_to_B, "\n\n")
     } else {
@@ -401,7 +411,7 @@ for (trait_A_file in trait_A_files) {
       cat("\n")
     }
     
-    cat("=== MR 分析 (B->A) ===\n")
+    cat("=== MR Analysis (B->A) ===\n")
     if (is.character(mr_result_B_to_A)) {
       cat(mr_result_B_to_A, "\n\n")
     } else {
@@ -409,7 +419,7 @@ for (trait_A_file in trait_A_files) {
       cat("\n")
     }
     
-    cat("=== 敏感性分析 (A->B) ===\n")
+    cat("=== Sensitivity Analysis (A->B) ===\n")
     if (is.character(hetero_res_AB)) {
       cat(hetero_res_AB, "\n")
     } else {
@@ -432,7 +442,7 @@ for (trait_A_file in trait_A_files) {
     }
     cat("\n")
     
-    cat("=== 敏感性分析 (B->A) ===\n")
+    cat("=== Sensitivity Analysis (B->A) ===\n")
     if (is.character(hetero_res_BA)) {
       cat(hetero_res_BA, "\n")
     } else {
@@ -455,7 +465,7 @@ for (trait_A_file in trait_A_files) {
     }
     cat("\n")
     
-    cat("=== 分析完成 ===\n")
+    cat("=== Analysis Completed ===\n")
     
     # 关闭 sink()
     sink()
@@ -463,10 +473,10 @@ for (trait_A_file in trait_A_files) {
   }, error = function(e) {
     # 如果发生错误，确保 sink() 被关闭
     sink()
-    cat("分析过程中发生错误：", conditionMessage(e), "\n")
+    cat("Error during analysis:", conditionMessage(e), "\n")
   })
   
-  cat("  分析结果已保存到:", output_file, "\n")
+  cat("  Results saved to:", output_file, "\n")
 }
 
-cat("\n=== 所有 Trait A 文件的分析已完成。 ===\n")
+cat("\n=== All Trait A Files Have Been Processed ===\n")
